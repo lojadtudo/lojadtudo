@@ -1117,11 +1117,12 @@ TUDO </h3>
     </div>
 
     <!-- Firebase SDK (Compat Version) -->
-    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+    <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+    <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
 
     <script>
+    document.addEventListener("DOMContentLoaded", () => {
         // ==========================================
         // CONFIGURAÇÃO DO FIREBASE (CONFIGURADA)
         // ==========================================
@@ -1212,59 +1213,94 @@ TUDO </h3>
         }
 
 
-        document.addEventListener('DOMContentLoaded', () => {
-            document.getElementById('newCategory').addEventListener('keydown', event => {
-                if (event.key === 'Enter') { event.preventDefault(); addCategory(); }
-            });
-            renderTabEditor();
-            tabsDoc.onSnapshot(snapshot => {
-                const data = snapshot.exists ? snapshot.data() : {};
-                Object.keys(tabDefaults).forEach(key => {
-                    catalogTabs[key] = { label: typeof data[key]?.label === 'string' && data[key].label.trim() ? data[key].label : tabDefaults[key].label, hidden: data[key]?.hidden === true };
-                });
-                renderTabEditor(); renderCatalog();
-            }, error => { document.getElementById('tabsStatus').textContent = 'Erro ao carregar abas: ' + error.message; });
-            updateWhatsappLinks();
-            document.getElementById('cfgWhatsapp').value = whatsappNum;
-            document.getElementById('cfgSort').value = currentSort;
-            
-            document.getElementById('searchInput').addEventListener('input', (e) => {
-                searchQuery = e.target.value.toLowerCase().trim();
-                clearTimeout(searchTimer);
-                searchTimer = setTimeout(renderCatalog, 150);
-            });
 
-            // A lista compartilhada é a fonte das categorias, inclusive após exclusões.
-            categoriesDoc.onSnapshot(snapshot => {
-                if (snapshot.exists && Array.isArray(snapshot.data().nomes)) {
-                    categories = snapshot.data().nomes;
-                    if (!categories.includes(activeCategory)) activeCategory = 'Todos';
+
+        let productCursor = null;
+        let productPagesDone = false;
+        let productPageTask = null;
+        let allProductsTask = null;
+        let stopAdminProducts = null;
+        let catalogLoadError = false;
+
+        function updateCatalogLoadControl() {
+            let control = document.getElementById('catalog-load-more');
+            if (!control) {
+                control = document.createElement('button');
+                control.id = 'catalog-load-more';
+                control.type = 'button';
+                control.className = 'btn-interest';
+                control.style.cssText = 'display:block;margin:20px auto;width:auto;padding:14px 24px';
+                control.onclick = () => loadNextProductPage();
+                document.getElementById('sec-todos').after(control);
+            }
+            control.hidden = productPagesDone || adminAuthorized;
+            control.style.display = control.hidden ? 'none' : 'block';
+            control.disabled = !!productPageTask;
+            control.textContent = catalogLoadError ? 'Tentar carregar produtos novamente' :
+                productPageTask ? 'Carregando produtos…' : 'Carregar mais produtos';
+            control.setAttribute('aria-live', 'polite');
+        }
+
+        function loadNextProductPage() {
+            if (productPageTask) return productPageTask;
+            if (productPagesDone || adminAuthorized) return Promise.resolve(true);
+            const firstPage = !productCursor;
+            // Inicia na próxima microtarefa para registrar a tarefa antes de renderizar o estado.
+            productPageTask = Promise.resolve().then(async () => {
+                try {
+                    let query = db.collection('produtos').orderBy('id', 'desc');
+                    if (productCursor) query = query.startAfter(productCursor);
+                    const pageSize = firstPage ? 6 : 12;
+                    const snapshot = await query.limit(pageSize).get();
+                    if (adminAuthorized) return true;
+                    const merged = new Map(products.map(p => [p.firestoreId, p]));
+                    snapshot.docs.forEach(doc => merged.set(doc.id, { firestoreId: doc.id, ...doc.data() }));
+                    products = Array.from(merged.values());
+                    if (snapshot.docs.length) productCursor = snapshot.docs[snapshot.docs.length - 1];
+                    productPagesDone = snapshot.docs.length < pageSize;
+                    catalogLoadError = false;
                     renderCategoryControls();
                     renderCatalog();
-                } else {
-                    categories = defaultCategories.slice();
-                    renderCategoryControls();
-                    renderCatalog();
+                    return true;
+                } catch (error) {
+                    catalogLoadError = true;
+                    console.error('Falha ao carregar produtos:', error);
+                    if (!products.length) document.getElementById('grid-todos').textContent =
+                        'Não foi possível carregar os produtos. Toque em tentar novamente.';
+                    return false;
+                } finally {
+                    productPageTask = null;
+                    updateCatalogLoadControl();
                 }
-            }, error => alert('Erro ao carregar categorias: ' + error.message));
-
-            // Carrega produtos do Firestore em tempo real
-            db.collection("produtos").onSnapshot((snapshot) => {
-                products = [];
-                snapshot.forEach((doc) => {
-                    products.push({ firestoreId: doc.id, ...doc.data() });
-                });
-                renderCategoryControls();
-                renderCatalog();
-                renderAdminTable();
-            }, error => {
-                const grid = document.getElementById('grid-todos');
-                if (!products.length) grid.textContent = 'Não foi possível carregar os produtos. Verifique sua conexão e atualize a página.';
-                console.error('Falha ao carregar catálogo:', error);
             });
+            updateCatalogLoadControl();
+            return productPageTask;
+        }
 
-            updateCartCount();
-        });
+        function ensureAllProducts() {
+            if (allProductsTask) return allProductsTask;
+            allProductsTask = Promise.resolve().then(async () => {
+                while (!productPagesDone && !adminAuthorized) {
+                    if (!await loadNextProductPage()) break;
+                    // Permite ao navegador desenhar os resultados entre as páginas.
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+            }).finally(() => { allProductsTask = null; });
+            return allProductsTask;
+        }
+
+        function startAdminProducts() {
+            if (stopAdminProducts) return;
+            stopAdminProducts = db.collection('produtos').onSnapshot(snapshot => {
+                products = snapshot.docs.map(doc => ({ firestoreId: doc.id, ...doc.data() }));
+                productPagesDone = true;
+                renderCategoryControls(); renderCatalog(); renderAdminTable();
+                updateCatalogLoadControl();
+            }, error => {
+                console.error('Falha no painel de produtos:', error);
+                alert('Não foi possível atualizar a lista administrativa. Reabra o painel.');
+            });
+        }
 
         function updateWhatsappLinks() {
             const defaultMsg = encodeURIComponent("Olá! Vim pelo catálogo da Loja DTudo e gostaria de mais informações!");
@@ -1406,6 +1442,7 @@ TUDO </h3>
 
         function filterCategory(cat) {
             activeCategory = cat;
+            if (cat !== 'Todos') ensureAllProducts();
             renderCategoryControls();
             renderCatalog();
         }
@@ -1737,6 +1774,7 @@ TUDO </h3>
             const panelView = document.getElementById('adminPanelView');
             adminAuthorized = false;
             if (!user) {
+                if (stopAdminProducts) { stopAdminProducts(); stopAdminProducts = null; }
                 document.getElementById('adminProductsTable').replaceChildren();
                 loginView.style.display = 'block';
                 panelView.style.display = 'none';
@@ -1746,6 +1784,8 @@ TUDO </h3>
                 const adminDoc = await db.collection('admins').doc(user.uid).get();
                 if (!adminDoc.exists) throw new Error('Conta sem permissão de administrador');
                 adminAuthorized = true;
+                startAdminProducts();
+                updateCatalogLoadControl();
                 loginView.style.display = 'none';
                 panelView.style.display = 'block';
                 renderAdminTable();
@@ -1770,6 +1810,7 @@ TUDO </h3>
 
         function changeSortOrder(val) {
             currentSort = val;
+            if (val !== 'recent') ensureAllProducts();
             localStorage.setItem('lojadtudo_sort', currentSort);
             renderCatalog();
         }
@@ -2076,6 +2117,55 @@ TUDO </h3>
             document.getElementById('pImgPreview').style.display = 'none';
             document.getElementById('formAdminTitle').innerText = "+ Adicionar Novo Produto";
         }
+
+        Object.assign(window, { applyCatalogTabs, renderTabEditor, saveCatalogTabs, updateCatalogLoadControl, loadNextProductPage, ensureAllProducts, startAdminProducts, updateWhatsappLinks, saveCart, updateCartCount, addToCart, changeCartQty, removeFromCart, openCart, closeCart, renderCart, clearPaymentError, updatePaymentOptions, getPaymentLabel, sendFullOrder, filterCategory, escapeCategoryText, toggleCategoryManager, categoryNameIsValid, addCategory, deleteCategory, renderCategoryControls, getSortedProducts, renderCatalog, renderProductBatch, createProductCard, openModal, closeModal, openAdminModal, closeAdminModal, loginAdmin, logoutAdmin, saveConfig, changeSortOrder, renderProductPhotos, prepareGalleryForSave, prepareImageForSave, imageStatus, resizeProductImage, previewImageFile, processProductImageFile, renderAdminTable, handleSaveProduct, editProduct, toggleHideProduct, deleteProduct, resetForm });
+        (() => {
+            document.getElementById('newCategory').addEventListener('keydown', event => {
+                if (event.key === 'Enter') { event.preventDefault(); addCategory(); }
+            });
+            renderTabEditor();
+            tabsDoc.onSnapshot(snapshot => {
+                const data = snapshot.exists ? snapshot.data() : {};
+                Object.keys(tabDefaults).forEach(key => {
+                    catalogTabs[key] = { label: typeof data[key]?.label === 'string' && data[key].label.trim() ? data[key].label : tabDefaults[key].label, hidden: data[key]?.hidden === true };
+                });
+                renderTabEditor(); renderCatalog();
+            }, error => { document.getElementById('tabsStatus').textContent = 'Erro ao carregar abas: ' + error.message; });
+            updateWhatsappLinks();
+            document.getElementById('cfgWhatsapp').value = whatsappNum;
+            document.getElementById('cfgSort').value = currentSort;
+            
+            document.getElementById('searchInput').addEventListener('input', (e) => {
+                searchQuery = e.target.value.toLowerCase().trim();
+                clearTimeout(searchTimer);
+                searchTimer = setTimeout(() => {
+                    renderCatalog();
+                    if (searchQuery) ensureAllProducts();
+                }, 150);
+            });
+
+            // A lista compartilhada é a fonte das categorias, inclusive após exclusões.
+            categoriesDoc.onSnapshot(snapshot => {
+                if (snapshot.exists && Array.isArray(snapshot.data().nomes)) {
+                    categories = snapshot.data().nomes;
+                    if (!categories.includes(activeCategory)) activeCategory = 'Todos';
+                    renderCategoryControls();
+                    renderCatalog();
+                } else {
+                    categories = defaultCategories.slice();
+                    renderCategoryControls();
+                    renderCatalog();
+                }
+            }, error => alert('Erro ao carregar categorias: ' + error.message));
+
+            // A primeira consulta baixa somente seis produtos, incluindo suas fotos.
+            updateCatalogLoadControl();
+            loadNextProductPage();
+            if (currentSort !== 'recent') ensureAllProducts();
+
+            updateCartCount();
+        })();
+    });
     </script>
 </body>
 </html>
