@@ -989,31 +989,8 @@ TUDO </h3>
                 </div>
 
                 <section class="payment-box" style="margin-bottom:20px">
-                    <h4>Fotos e velocidade do catálogo</h4>
-                    <p class="payment-note">Novas fotos serão armazenadas separadamente. O catálogo usa miniaturas; as fotos maiores aparecem ao abrir o produto.</p>
                     <button type="button" class="btn-interest" id="migrateImagesBtn" onclick="migrateProductImages()">Migrar fotos dos produtos antigos</button>
-                    <p class="payment-note">A migração baixa uma cópia de segurança antes de começar. Mantenha esta página aberta até terminar. Se interromper, clique novamente para continuar os produtos pendentes.</p>
                     <p id="migrationStatus" role="status" style="margin-top:10px"></p>
-                    <details style="margin-top:12px"><summary>Configurar armazenamento das fotos</summary>
-                        <p class="payment-note">No console do Firebase, abra o projeto lojaddtudo-bb639 → Storage. O serviço exige o plano Blaze, com cobrança conforme o uso. Crie o bucket lojaddtudo-bb639.firebasestorage.app e configure as regras abaixo. Se já houver regras, integre esta permissão às existentes. A primeira publicação pode solicitar a integração entre Storage e Firestore.</p>
-                        <p class="payment-note">Envio permitido somente às contas cadastradas na coleção admins. As fotos do catálogo são públicas.</p>
-                        <pre style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;padding:10px;background:var(--bg-input)">rules_version = '2';
-service firebase.storage {
-  match /b/{bucket}/o {
-    match /catalogo/{uid}/{productId}/{fileName} {
-      allow read: if true;
-      allow create, update: if request.auth != null
-        &amp;&amp; request.auth.uid == uid
-        &amp;&amp; firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid))
-        &amp;&amp; request.resource.size &lt; 1024 * 1024
-        &amp;&amp; request.resource.contentType == 'image/jpeg';
-      allow delete: if request.auth != null
-        &amp;&amp; request.auth.uid == uid
-        &amp;&amp; firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid));
-    }
-  }
-}</pre>
-                    </details>
                 </section>
                 <button type="button" class="btn-interest" style="margin-bottom:16px" onclick="toggleCategoryManager()" id="categoryToggle" aria-expanded="false" aria-controls="categoryManager">Gerenciar categorias</button>
                 <section class="payment-box" id="tabManager" style="margin-bottom:20px">
