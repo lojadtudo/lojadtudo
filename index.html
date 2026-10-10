@@ -988,10 +988,6 @@ TUDO </h3>
                     <button class="btn-action btn-delete" onclick="logoutAdmin()">Sair</button>
                 </div>
 
-                <section class="payment-box" style="margin-bottom:20px">
-                    <button type="button" class="btn-interest" id="migrateImagesBtn" onclick="migrateProductImages()">Migrar fotos dos produtos antigos</button>
-                    <p id="migrationStatus" role="status" style="margin-top:10px"></p>
-                </section>
                 <button type="button" class="btn-interest" style="margin-bottom:16px" onclick="toggleCategoryManager()" id="categoryToggle" aria-expanded="false" aria-controls="categoryManager">Gerenciar categorias</button>
                 <section class="payment-box" id="tabManager" style="margin-bottom:20px">
 <h4>Editar abas do catálogo</h4>
@@ -1124,7 +1120,6 @@ TUDO </h3>
     <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
     <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
-    <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-storage-compat.js"></script>
 
     <script>
     document.addEventListener("DOMContentLoaded", async () => {
@@ -1314,13 +1309,21 @@ TUDO </h3>
             return productPageTask;
         }
 
+        let detailPhotoRequests = 0;
+        async function waitForCatalogPriority() {
+            while (document.hidden || detailPhotoRequests > 0) {
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+        }
+
         function ensureAllProducts() {
             if (allProductsTask) return allProductsTask;
             allProductsTask = Promise.resolve().then(async () => {
                 while (!productPagesDone && !adminAuthorized) {
+                    await waitForCatalogPriority();
                     if (!await loadNextProductPage()) break;
-                    // Permite ao navegador desenhar os resultados entre as páginas.
-                    await new Promise(resolve => setTimeout(resolve, 200));
+                    // A imagem aberta pelo cliente tem prioridade sobre a próxima página.
+                    await new Promise(resolve => setTimeout(resolve, 700));
                 }
             }).finally(() => { allProductsTask = null; });
             return allProductsTask;
@@ -1328,11 +1331,12 @@ TUDO </h3>
 
         function startAdminProducts() {
             if (stopAdminProducts) return;
-            stopAdminProducts = db.collection('produtos').onSnapshot(snapshot => {
+            stopAdminProducts = db.collection('produtos').orderBy('id', 'desc').onSnapshot(snapshot => {
                 products = snapshot.docs.map(doc => ({ firestoreId: doc.id, ...doc.data() }));
                 productPagesDone = true;
                 renderCategoryControls(); renderCatalog(); renderAdminTable();
                 updateCatalogLoadControl();
+                if (!snapshot.metadata?.fromCache) optimizeLegacyProducts();
             }, error => {
                 console.error('Falha no painel de produtos:', error);
                 alert('Não foi possível atualizar a lista administrativa. Reabra o painel.');
@@ -1744,22 +1748,142 @@ TUDO </h3>
             return card;
         }
 
+        const fullPhotoCache = new Map();
+        const fullPhotoTasks = new Map();
+        let modalPhotoToken = 0;
+        let editingPhotosLoading = false;
+        let optimizingPhotos = false;
+        let photoOptimizationBlocked = false;
+        const attemptedPhotoOptimization = new Set();
+
+        function photoDocumentId(productId) { return '__fotos__' + productId; }
+        function photoCacheKey(product) { return product.photoDocId + ':' + product.photoVersion; }
+        function rememberPhotos(key, photos) {
+            fullPhotoCache.delete(key);
+            fullPhotoCache.set(key, photos);
+            if (fullPhotoCache.size > 20) fullPhotoCache.delete(fullPhotoCache.keys().next().value);
+        }
+        async function loadProductPhotos(product) {
+            if (product.mediaVersion !== 3 || !product.photoDocId) {
+                return Array.isArray(product.images) && product.images.length ? product.images : [product.img];
+            }
+            const key = photoCacheKey(product);
+            if (fullPhotoCache.has(key)) return fullPhotoCache.get(key);
+            if (fullPhotoTasks.has(key)) return fullPhotoTasks.get(key);
+            detailPhotoRequests++;
+            const task = (async () => {
+                const ref = db.collection('produtos').doc(product.photoDocId);
+                let snapshot;
+                try {
+                    const cached = await ref.get({ source: 'cache' });
+                    if (cached.exists && cached.data().version === product.photoVersion) snapshot = cached;
+                } catch (_) {}
+                if (!snapshot) snapshot = await ref.get();
+                if (!snapshot.exists || snapshot.data().kind !== 'productPhotos' || snapshot.data().productId !== product.firestoreId ||
+                    !Array.isArray(snapshot.data().images) || !snapshot.data().images.length) {
+                    throw new Error('As fotos não estão disponíveis. Tente novamente.');
+                }
+                const photos = snapshot.data().images;
+                rememberPhotos(key, photos);
+                return photos;
+            })().finally(() => { detailPhotoRequests--; fullPhotoTasks.delete(key); });
+            fullPhotoTasks.set(key, task);
+            return task;
+        }
+
+        function showModalPhotos(product, photos) {
+            document.getElementById('mImg').src = photos[0] || product.img;
+            const gallery = document.getElementById('mGallery'); gallery.replaceChildren();
+            photos.slice(1).forEach((src, index) => {
+                const photo = document.createElement('img');
+                photo.src = src; photo.alt = product.name + ' — foto ' + (index + 2);
+                photo.loading = 'lazy'; photo.decoding = 'async';
+                photo.style.cssText = 'display:block;width:100%;height:auto;max-height:650px;object-fit:contain;border-radius:10px';
+                gallery.append(photo);
+            });
+        }
+
+        // A foto completa não tem o campo id: consultas orderBy('id') só baixam produtos.
+        async function writeProductWithPhotos(ref, productData, media, isUpdate, originalPhotos = null) {
+            const photoRef = db.collection('produtos').doc(photoDocumentId(ref.id));
+            const version = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+            const photoData = { kind: 'productPhotos', productId: ref.id, version, images: media.images };
+            const metadata = { ...productData, img: media.img, mediaVersion: 3, photoDocId: photoRef.id, photoVersion: version };
+            delete metadata.images;
+            if (new Blob([JSON.stringify(photoData)]).size > 900000 || new Blob([JSON.stringify(metadata)]).size > 900000) {
+                throw new Error('As fotos ou a descrição excedem o limite. Reduza a quantidade de fotos ou o texto.');
+            }
+            await db.runTransaction(async transaction => {
+                const current = await transaction.get(ref);
+                const priorPhoto = await transaction.get(photoRef);
+                if (isUpdate && !current.exists) throw new Error('Este produto já foi removido.');
+                if (!isUpdate && current.exists) throw new Error('Já existe um produto com este identificador.');
+                if (priorPhoto.exists && (priorPhoto.data().kind !== 'productPhotos' || priorPhoto.data().productId !== ref.id)) {
+                    throw new Error('Identificador de fotos indisponível. Nenhum dado foi alterado.');
+                }
+                if (originalPhotos && JSON.stringify([current.data().img, current.data().images, current.data().photoVersion]) !== originalPhotos) {
+                    throw new Error('O produto mudou durante a otimização; será mantida a versão mais recente.');
+                }
+                transaction.set(photoRef, photoData);
+                if (isUpdate) transaction.update(ref, { ...metadata, images: firebase.firestore.FieldValue.delete() });
+                else transaction.set(ref, metadata);
+            });
+            rememberPhotos(photoRef.id + ':' + version, media.images);
+            return metadata;
+        }
+
+        function optimizationStatus(message) {
+            let status = document.getElementById('photoOptimizationStatus');
+            if (!status) {
+                status = document.createElement('p'); status.id = 'photoOptimizationStatus';
+                status.setAttribute('role', 'status'); status.className = 'payment-note';
+                document.getElementById('adminPanelView').append(status);
+            }
+            status.textContent = message;
+        }
+
+        async function optimizeLegacyProducts() {
+            if (!adminAuthorized || optimizingPhotos || photoOptimizationBlocked) return;
+            optimizingPhotos = true;
+            try {
+                while (adminAuthorized) {
+                    const product = products.find(p => p.mediaVersion !== 3 && !attemptedPhotoOptimization.has(p.firestoreId));
+                    if (!product) break;
+                    if (productSaveInProgress || editingPhotosLoading || productImageProcessing || document.hidden) {
+                        await new Promise(resolve => setTimeout(resolve, 500)); continue;
+                    }
+                    attemptedPhotoOptimization.add(product.firestoreId);
+                    const original = JSON.stringify([product.img, product.images, product.photoVersion]);
+                    const sources = Array.isArray(product.images) && product.images.length ? product.images : [product.img];
+                    const media = await prepareGalleryForSave(sources, true);
+                    if (!adminAuthorized) break;
+                    // Altera apenas os campos de foto, preservando preço, nome, estoque e visibilidade.
+                    await writeProductWithPhotos(db.collection('produtos').doc(product.firestoreId), {}, media, true, original);
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+            } catch (error) {
+                photoOptimizationBlocked = true;
+                console.error('Otimização de fotos:', error);
+                optimizationStatus('Não foi possível otimizar todas as fotos. Os cadastros pendentes foram preservados. Detalhe: ' + error.message);
+            } finally { optimizingPhotos = false; }
+        }
+
         function openModal(id) {
             const product = products.find(p => p.id === id);
             if (!product) return;
 
-            document.getElementById('mImg').src = product.images?.[0] || product.img;
-            const gallery = document.getElementById('mGallery');
-            gallery.replaceChildren();
-            const photos = Array.isArray(product.images) && product.images.length ? product.images : [product.img];
+            const token = ++modalPhotoToken;
+            showModalPhotos(product, [product.img]);
             document.getElementById('mImg').alt = product.name;
-            photos.slice(1).forEach((src, index) => {
-                const photo = document.createElement('img');
-                photo.src = src;
-                photo.alt = product.name + ' — foto ' + (index + 2);
-                photo.loading = 'lazy';
-                photo.style.cssText = 'display:block;width:100%;height:auto;max-height:650px;object-fit:contain;border-radius:10px';
-                gallery.append(photo);
+            loadProductPhotos(product).then(photos => {
+                if (token === modalPhotoToken) showModalPhotos(product, photos);
+            }).catch(error => {
+                if (token !== modalPhotoToken) return;
+                const retry = document.createElement('button'); retry.type = 'button';
+                retry.className = 'btn-interest'; retry.textContent = 'Tentar carregar fotos novamente';
+                retry.onclick = () => openModal(id);
+                document.getElementById('mGallery').replaceChildren(retry);
+                console.warn(error.message);
             });
             document.getElementById('mTitle').innerText = product.name;
             document.getElementById('mDesc').innerText = product.desc;
@@ -1806,6 +1930,7 @@ TUDO </h3>
         }
 
         function closeModal() {
+            modalPhotoToken++;
             document.getElementById('productModal').classList.remove('active');
             document.body.style.overflow = ''; 
         }
@@ -1908,123 +2033,29 @@ TUDO </h3>
                 gallery.append(wrap);
             });
         }
-        function storageErrorMessage(error) {
-            if (/^storage\//.test(error.code || '')) {
-                return 'Não foi possível enviar a foto ao Firebase Storage (' + error.code + '). Confira Storage, plano Blaze, nome do bucket e regras de acesso nas instruções do painel. O produto anterior foi preservado.';
-            }
-            return error.message || 'Não foi possível salvar as fotos.';
-        }
-
-        async function uploadCatalogPhoto(data, productId, suffix) {
-            if (!adminAuthorized || !auth.currentUser) throw new Error('Entre como administrador para enviar fotos.');
-            if (typeof firebase.storage !== 'function') throw new Error('Não foi possível carregar o armazenamento. Verifique sua conexão e reabra o painel.');
-            const unique = Date.now() + '-' + Math.random().toString(36).slice(2);
-            const ref = firebase.storage().ref('catalogo/' + auth.currentUser.uid + '/' + productId + '/' + unique + '-' + suffix + '.jpg');
-            await ref.putString(data, 'data_url', {
-                contentType: 'image/jpeg', cacheControl: 'public,max-age=31536000,immutable'
-            });
-            return ref.getDownloadURL();
-        }
-
-        async function prepareGalleryForSave(sources, productId, existingProduct = null) {
+        async function prepareGalleryForSave(sources, silent = false) {
+            if (!sources.length) throw new Error('Adicione pelo menos uma foto.');
+            const budget = Math.min(PRODUCT_IMAGE_MAX_BYTES, Math.floor(220000 / sources.length));
             const images = [];
             let thumbnail = '';
             for (let i = 0; i < sources.length; i++) {
                 const source = String(sources[i] || '').trim();
                 if (/^(data:image\/|blob:)/i.test(source)) {
-                    imageStatus('Enviando foto ' + (i + 1) + ' de ' + sources.length + '…');
+                    if (!silent) imageStatus('Preparando foto ' + (i + 1) + ' de ' + sources.length + '…');
                     const response = await fetch(source);
                     if (!response.ok) throw new Error('Não foi possível ler uma das fotos.');
                     const blob = await response.blob();
-                    const full = await resizeProductImage(blob, 240000, 1280);
-                    images.push(await uploadCatalogPhoto(full.data, productId, 'foto-' + i));
-                    if (i === 0) {
-                        const small = await resizeProductImage(blob, 22000, 360);
-                        thumbnail = await uploadCatalogPhoto(small.data, productId, 'miniatura');
-                    }
+                    const photo = await resizeProductImage(blob, budget, 800);
+                    images.push(photo.data);
+                    if (i === 0) thumbnail = (await resizeProductImage(blob, 14000, 320)).data;
                 } else {
-                    if (!/^https?:\/\//i.test(source)) throw new Error('Use um link HTTP/HTTPS ou selecione uma foto do dispositivo.');
+                    if (!/^https?:\/\//i.test(source)) throw new Error('Selecione uma foto do dispositivo ou informe um link HTTP/HTTPS válido.');
+                    if (new Blob([source]).size > budget) throw new Error('O link da imagem é muito longo. Selecione a foto do dispositivo.');
                     images.push(source);
-                    if (i === 0) {
-                        if (existingProduct?.mediaVersion === 2 && existingProduct.images?.[0] === source) {
-                            thumbnail = existingProduct.img;
-                        } else {
-                            // Links externos continuam funcionando mesmo se o provedor impedir a conversão por CORS.
-                            try {
-                                const response = await fetch(source);
-                                if (!response.ok) throw new Error('Foto externa indisponível');
-                                const small = await resizeProductImage(await response.blob(), 22000, 360);
-                                thumbnail = await uploadCatalogPhoto(small.data, productId, 'miniatura');
-                            } catch (error) {
-                                if (/^storage\//.test(error.code || '')) throw error;
-                                thumbnail = source;
-                            }
-                        }
-                    }
+                    if (i === 0) thumbnail = source;
                 }
             }
-            if (!images.length) throw new Error('Adicione pelo menos uma foto.');
-            return { images, img: thumbnail || images[0], mediaVersion: 2 };
-        }
-
-        let migrationInProgress = false;
-        function downloadProductsBackup(items) {
-            const blob = new Blob([JSON.stringify({ createdAt: new Date().toISOString(), products: items }, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = 'backup-produtos-dtudo-' + new Date().toISOString().slice(0, 10) + '.json';
-            document.body.appendChild(link); link.click(); link.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 60000);
-        }
-
-        async function migrateProductImages() {
-            if (migrationInProgress || productSaveInProgress) return;
-            const status = document.getElementById('migrationStatus');
-            if (!adminAuthorized || !auth.currentUser) { status.textContent = 'Entre como administrador.'; return; }
-            migrationInProgress = true;
-            const button = document.getElementById('migrateImagesBtn'); button.disabled = true;
-            let migrated = 0;
-            let pendingCount = 0;
-            try {
-                if (stopAdminProducts) { stopAdminProducts(); stopAdminProducts = null; }
-                status.textContent = 'Preparando cópia de segurança…';
-                const snapshot = await db.collection('produtos').get({ source: 'server' });
-                const items = snapshot.docs.map(doc => ({ firestoreId: doc.id, ...doc.data() }));
-                const pending = items.filter(p => p.mediaVersion !== 2 || [p.img, ...(p.images || [])].some(src => /^(data:image\/|blob:)/i.test(String(src))));
-                pendingCount = pending.length;
-                if (!pendingCount) { status.textContent = 'Todos os produtos já usam fotos separadas.'; return; }
-                downloadProductsBackup(items);
-                for (const p of pending) {
-                    if (!adminAuthorized || !auth.currentUser) throw new Error('Sessão encerrada. Entre novamente para continuar.');
-                    status.textContent = 'Migrando produto ' + (migrated + 1) + ' de ' + pendingCount + '…';
-                    // Releitura evita sobrescrever uma edição feita durante a migração.
-                    const ref = db.collection('produtos').doc(p.firestoreId);
-                    const current = await ref.get({ source: 'server' });
-                    if (!current.exists) continue;
-                    const data = current.data();
-                    const sources = Array.isArray(data.images) && data.images.length ? data.images : [data.img];
-                    const media = await prepareGalleryForSave(sources, p.firestoreId, data);
-                    // Só troca os campos de imagem depois que todos os envios terminaram.
-                    await db.runTransaction(async transaction => {
-                        const latest = await transaction.get(ref);
-                        if (!latest.exists) throw new Error('Produto removido durante a migração.');
-                        const latestData = latest.data();
-                        if (JSON.stringify([latestData.img, latestData.images]) !== JSON.stringify([data.img, data.images])) {
-                            throw new Error('As fotos foram alteradas por outra sessão. Execute a migração novamente.');
-                        }
-                        transaction.update(ref, media);
-                    });
-                    migrated++;
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                }
-                status.textContent = 'Concluído: ' + migrated + ' produtos migrados. Guarde a cópia de segurança.';
-            } catch (error) {
-                status.textContent = 'Migração interrompida após ' + migrated + ' de ' + pendingCount + ' produtos. ' + storageErrorMessage(error) + ' Clique novamente para continuar os pendentes.';
-            } finally {
-                migrationInProgress = false; button.disabled = false; imageStatus('');
-                if (adminAuthorized && auth.currentUser) startAdminProducts();
-            }
+            return { images, img: thumbnail || images[0] };
         }
 
         async function prepareImageForSave(source) {
@@ -2110,7 +2141,7 @@ TUDO </h3>
             try {
                 const added = [];
                 for (const file of files) {
-                    const result = await resizeProductImage(file, 240000, 1280);
+                    const result = await resizeProductImage(file, PRODUCT_IMAGE_MAX_BYTES, 800);
                     if (version !== productImageVersion) return;
                     added.push(result.data);
                 }
@@ -2158,6 +2189,7 @@ TUDO </h3>
 
         async function handleSaveProduct(e) {
             e.preventDefault();
+            if (editingPhotosLoading) { imageStatus('Aguarde as fotos do produto carregarem.'); return; }
             if (productImageProcessing) {
                 imageStatus('Ajustando a foto para salvar…');
                 await productImageTask;
@@ -2188,7 +2220,7 @@ TUDO </h3>
                 img = imgPreview.src;
             }
 
-            if (productSaveInProgress || migrationInProgress) return;
+            if (productSaveInProgress) return;
             if (!adminAuthorized || !auth.currentUser) { alert('Entre como administrador.'); return; }
             const productRef = firestoreId ? db.collection('produtos').doc(firestoreId) : db.collection('produtos').doc();
             const existingProduct = products.find(p => p.firestoreId === firestoreId);
@@ -2199,19 +2231,19 @@ TUDO </h3>
             try {
                 const sources = productPhotos.length ? [...productPhotos] : [img];
                 if (imgUrlInput && !sources.includes(imgUrlInput)) sources.unshift(imgUrlInput);
-                const media = await prepareGalleryForSave(sources, productRef.id, existingProduct);
+                const media = await prepareGalleryForSave(sources);
                 images = media.images;
                 img = media.img;
             } catch (error) {
                 productSaveInProgress = false;
                 if (saveButton) saveButton.disabled = false;
-                alert(storageErrorMessage(error));
+                alert(error.message || 'Não foi possível preparar as fotos.');
                 return;
             }
 
             const productData = {
                 id: firestoreId ? (products.find(p => p.firestoreId === firestoreId)?.id || Date.now()) : Date.now(),
-                name, price, oldPrice, desc, category, available, isOffer, isFeatured, isNew, img, images, mediaVersion: 2, hidden: existingProduct?.hidden || false
+                name, price, oldPrice, desc, category, available, isOffer, isFeatured, isNew, img, hidden: existingProduct?.hidden || false
             };
 
             try {
@@ -2222,8 +2254,7 @@ TUDO </h3>
                 if (new Blob([JSON.stringify(productData)]).size > 900000) {
                     throw new Error('O produto contém dados demais. Reduza a descrição ou selecione outra foto.');
                 }
-                if (firestoreId) await productRef.update(productData);
-                else await productRef.set(productData);
+                await writeProductWithPhotos(productRef, productData, { img, images }, !!firestoreId);
                 resetForm();
                 alert('Produto salvo com sucesso no Firebase!');
             } catch (error) {
@@ -2234,14 +2265,28 @@ TUDO </h3>
             }
         }
 
-        function editProduct(firestoreId) {
-            productImageVersion++;
+        async function editProduct(firestoreId) {
+            const editVersion = ++productImageVersion;
+            editingPhotosLoading = false;
             productImageProcessing = false;
             productImageError = false;
             imageStatus('');
             const p = products.find(item => item.firestoreId === firestoreId);
             if (!p) return;
 
+            editingPhotosLoading = true;
+            let loadedPhotos;
+            try {
+                imageStatus('Carregando fotos do produto…');
+                loadedPhotos = await loadProductPhotos(p);
+                if (editVersion !== productImageVersion) return;
+            } catch (error) {
+                if (editVersion === productImageVersion) imageStatus(error.message);
+                return;
+            } finally {
+                if (editVersion === productImageVersion) editingPhotosLoading = false;
+            }
+            imageStatus('');
             document.getElementById('pId').value = p.firestoreId;
             document.getElementById('pName').value = p.name;
             document.getElementById('pPrice').value = p.price;
@@ -2254,7 +2299,7 @@ TUDO </h3>
             document.getElementById('pIsFeatured').checked = p.isFeatured;
             document.getElementById('pIsNew').checked = p.isNew;
 
-            productPhotos = Array.isArray(p.images) && p.images.length ? [...p.images] : [p.img];
+            productPhotos = [...loadedPhotos];
             renderProductPhotos();
             document.getElementById('pImgFile').value = '';
             document.getElementById('pImgUrl').value = '';
@@ -2273,14 +2318,23 @@ TUDO </h3>
             }
         }
 
-        function deleteProduct(firestoreId) {
-            if (confirm('Tem certeza que deseja excluir este produto do banco de dados?')) {
-                db.collection("produtos").doc(firestoreId).delete().catch(error => alert("Erro ao excluir: " + error.message));
-            }
+        async function deleteProduct(firestoreId) {
+            if (!confirm('Tem certeza que deseja excluir este produto do banco de dados?')) return;
+            try {
+                const ref = db.collection('produtos').doc(firestoreId);
+                await db.runTransaction(async transaction => {
+                    const current = await transaction.get(ref);
+                    if (!current.exists) return;
+                    const photoId = current.data().photoDocId;
+                    if (photoId === photoDocumentId(firestoreId)) transaction.delete(db.collection('produtos').doc(photoId));
+                    transaction.delete(ref);
+                });
+            } catch (error) { alert('Erro ao excluir: ' + error.message); }
         }
 
         function resetForm() {
             productImageVersion++;
+            editingPhotosLoading = false;
             productImageProcessing = false;
             productImageError = false;
             imageStatus('');
@@ -2293,7 +2347,7 @@ TUDO </h3>
             document.getElementById('formAdminTitle').innerText = "+ Adicionar Novo Produto";
         }
 
-        Object.assign(window, { migrateProductImages, applyCatalogTabs, renderTabEditor, saveCatalogTabs, updateCatalogLoadControl, loadNextProductPage, ensureAllProducts, startAdminProducts, updateWhatsappLinks, saveCart, updateCartCount, addToCart, changeCartQty, removeFromCart, openCart, closeCart, renderCart, clearPaymentError, updatePaymentOptions, getPaymentLabel, sendFullOrder, filterCategory, escapeCategoryText, toggleCategoryManager, categoryNameIsValid, addCategory, deleteCategory, renderCategoryControls, getSortedProducts, renderCatalog, renderProductBatch, createProductCard, openModal, closeModal, openAdminModal, closeAdminModal, loginAdmin, logoutAdmin, saveConfig, changeSortOrder, renderProductPhotos, prepareGalleryForSave, prepareImageForSave, imageStatus, resizeProductImage, previewImageFile, processProductImageFile, renderAdminTable, handleSaveProduct, editProduct, toggleHideProduct, deleteProduct, resetForm });
+        Object.assign(window, { applyCatalogTabs, renderTabEditor, saveCatalogTabs, updateCatalogLoadControl, loadNextProductPage, ensureAllProducts, startAdminProducts, updateWhatsappLinks, saveCart, updateCartCount, addToCart, changeCartQty, removeFromCart, openCart, closeCart, renderCart, clearPaymentError, updatePaymentOptions, getPaymentLabel, sendFullOrder, filterCategory, escapeCategoryText, toggleCategoryManager, categoryNameIsValid, addCategory, deleteCategory, renderCategoryControls, getSortedProducts, renderCatalog, renderProductBatch, createProductCard, openModal, closeModal, openAdminModal, closeAdminModal, loginAdmin, logoutAdmin, saveConfig, changeSortOrder, renderProductPhotos, prepareGalleryForSave, prepareImageForSave, imageStatus, resizeProductImage, previewImageFile, processProductImageFile, renderAdminTable, handleSaveProduct, editProduct, toggleHideProduct, deleteProduct, resetForm });
         (() => {
             document.getElementById('newCategory').addEventListener('keydown', event => {
                 if (event.key === 'Enter') { event.preventDefault(); addCategory(); }
