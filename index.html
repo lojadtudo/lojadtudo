@@ -921,7 +921,7 @@
         </svg>
         <h3 style="font-size: 1.1rem; font-weight: 700;">LOJA D
 TUDO </h3>
-        <p style="font-size: 0.8rem; color: var(--text-gray);">Makes, acessórios e papelaria — aqui você encontra DaTudo! 💗</p>
+        <p style="font-size: 0.8rem; color: var(--text-gray);">Makes, acessórios e papelaria — aqui você encontra DTudo! 💗</p>
         <p style="font-size: 0.8rem; color: var(--text-gray); margin-top: 7px;"><i class="fa-solid fa-location-dot" style="color: var(--accent-gold);"></i> Rua São Francisco, nº 235, Centro, Demerval Lobão/PI</p>
 
         <div style="margin: 15px 0;">
@@ -988,6 +988,33 @@ TUDO </h3>
                     <button class="btn-action btn-delete" onclick="logoutAdmin()">Sair</button>
                 </div>
 
+                <section class="payment-box" style="margin-bottom:20px">
+                    <h4>Fotos e velocidade do catálogo</h4>
+                    <p class="payment-note">Novas fotos serão armazenadas separadamente. O catálogo usa miniaturas; as fotos maiores aparecem ao abrir o produto.</p>
+                    <button type="button" class="btn-interest" id="migrateImagesBtn" onclick="migrateProductImages()">Migrar fotos dos produtos antigos</button>
+                    <p class="payment-note">A migração baixa uma cópia de segurança antes de começar. Mantenha esta página aberta até terminar. Se interromper, clique novamente para continuar os produtos pendentes.</p>
+                    <p id="migrationStatus" role="status" style="margin-top:10px"></p>
+                    <details style="margin-top:12px"><summary>Configurar armazenamento das fotos</summary>
+                        <p class="payment-note">No console do Firebase, abra o projeto lojaddtudo-bb639 → Storage. O serviço exige o plano Blaze, com cobrança conforme o uso. Crie o bucket lojaddtudo-bb639.firebasestorage.app e configure as regras abaixo. Se já houver regras, integre esta permissão às existentes. A primeira publicação pode solicitar a integração entre Storage e Firestore.</p>
+                        <p class="payment-note">Envio permitido somente às contas cadastradas na coleção admins. As fotos do catálogo são públicas.</p>
+                        <pre style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;padding:10px;background:var(--bg-input)">rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /catalogo/{uid}/{productId}/{fileName} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+        &amp;&amp; request.auth.uid == uid
+        &amp;&amp; firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid))
+        &amp;&amp; request.resource.size &lt; 1024 * 1024
+        &amp;&amp; request.resource.contentType == 'image/jpeg';
+      allow delete: if request.auth != null
+        &amp;&amp; request.auth.uid == uid
+        &amp;&amp; firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid));
+    }
+  }
+}</pre>
+                    </details>
+                </section>
                 <button type="button" class="btn-interest" style="margin-bottom:16px" onclick="toggleCategoryManager()" id="categoryToggle" aria-expanded="false" aria-controls="categoryManager">Gerenciar categorias</button>
                 <section class="payment-box" id="tabManager" style="margin-bottom:20px">
 <h4>Editar abas do catálogo</h4>
@@ -1120,9 +1147,10 @@ TUDO </h3>
     <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
     <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+    <script defer src="https://www.gstatic.com/firebasejs/10.8.0/firebase-storage-compat.js"></script>
 
     <script>
-    document.addEventListener("DOMContentLoaded", () => {
+    document.addEventListener("DOMContentLoaded", async () => {
         // ==========================================
         // CONFIGURAÇÃO DO FIREBASE (CONFIGURADA)
         // ==========================================
@@ -1139,8 +1167,11 @@ TUDO </h3>
         firebase.initializeApp(firebaseConfig);
         const db = firebase.firestore();
         const auth = firebase.auth();
-        // Reutiliza os dados já baixados em acessos posteriores, quando suportado.
-        db.enablePersistence({ synchronizeTabs: true }).catch(() => {});
+        // Ativa IndexedDB antes de iniciar qualquer consulta ao Firestore.
+        // O cache permanece entre acessos e pode ser compartilhado por várias abas.
+        await db.enablePersistence({ synchronizeTabs: true }).catch(error => {
+            console.warn('Cache persistente indisponível; usando cache em memória.', error.code);
+        });
         let adminAuthorized = false;
         let searchTimer;
 
@@ -1230,30 +1261,59 @@ TUDO </h3>
                 control.type = 'button';
                 control.className = 'btn-interest';
                 control.style.cssText = 'display:block;margin:20px auto;width:auto;padding:14px 24px';
-                control.onclick = () => loadNextProductPage();
+                control.onclick = () => ensureAllProducts();
                 document.getElementById('sec-todos').after(control);
             }
             control.hidden = productPagesDone || adminAuthorized;
             control.style.display = control.hidden ? 'none' : 'block';
             control.disabled = !!productPageTask;
             control.textContent = catalogLoadError ? 'Tentar carregar produtos novamente' :
-                productPageTask ? 'Carregando produtos…' : 'Carregar mais produtos';
+                'carregando mais produtos';
             control.setAttribute('aria-live', 'polite');
         }
 
         function loadNextProductPage() {
             if (productPageTask) return productPageTask;
             if (productPagesDone || adminAuthorized) return Promise.resolve(true);
-            const firstPage = !productCursor;
             // Inicia na próxima microtarefa para registrar a tarefa antes de renderizar o estado.
             productPageTask = Promise.resolve().then(async () => {
                 try {
                     let query = db.collection('produtos').orderBy('id', 'desc');
                     if (productCursor) query = query.startAfter(productCursor);
-                    const pageSize = firstPage ? 6 : 12;
-                    const snapshot = await query.limit(pageSize).get();
+                    const pageSize = 10;
+                    query = query.limit(pageSize);
+                    let cached = null;
+                    try {
+                        cached = await query.get({ source: 'cache' });
+                        if (!adminAuthorized && cached.docs.length) {
+                            const localProducts = new Map(products.map(p => [p.firestoreId, p]));
+                            cached.docs.forEach(doc => localProducts.set(doc.id, { firestoreId: doc.id, ...doc.data() }));
+                            products = Array.from(localProducts.values());
+                            renderCategoryControls();
+                            renderCatalog();
+                        }
+                    } catch (_) { /* Primeiro acesso ou cache não disponível. */ }
+
+                    let snapshot;
+                    let fresh = false;
+                    try {
+                        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+                            throw new Error('Sem conexão');
+                        }
+                        snapshot = await query.get({ source: 'server' });
+                        fresh = true;
+                    } catch (error) {
+                        if (!cached || !cached.docs.length) throw error;
+                        snapshot = cached;
+                    }
                     if (adminAuthorized) return true;
-                    const merged = new Map(products.map(p => [p.firestoreId, p]));
+                    // A primeira página confirmada substitui dados antigos, inclusive itens removidos.
+                    const merged = new Map((fresh && !productCursor ? [] : products).map(p => [p.firestoreId, p]));
+                    // Remove documentos obsoletos da página em cache antes de aplicar a versão atual.
+                    if (fresh && cached) {
+                        const currentIds = new Set(snapshot.docs.map(doc => doc.id));
+                        cached.docs.forEach(doc => { if (!currentIds.has(doc.id)) merged.delete(doc.id); });
+                    }
                     snapshot.docs.forEach(doc => merged.set(doc.id, { firestoreId: doc.id, ...doc.data() }));
                     products = Array.from(merged.values());
                     if (snapshot.docs.length) productCursor = snapshot.docs[snapshot.docs.length - 1];
@@ -1283,7 +1343,7 @@ TUDO </h3>
                 while (!productPagesDone && !adminAuthorized) {
                     if (!await loadNextProductPage()) break;
                     // Permite ao navegador desenhar os resultados entre as páginas.
-                    await new Promise(resolve => setTimeout(resolve, 0));
+                    await new Promise(resolve => setTimeout(resolve, 200));
                 }
             }).finally(() => { allProductsTask = null; });
             return allProductsTask;
@@ -1564,10 +1624,6 @@ TUDO </h3>
             const gridNovidades = document.getElementById('grid-novidades');
             const gridTodos = document.getElementById('grid-todos');
 
-            gridOfertas.innerHTML = '';
-            gridDestaques.innerHTML = '';
-            gridNovidades.innerHTML = '';
-            gridTodos.innerHTML = '';
 
             let filtered = products.filter(p => !p.hidden);
 
@@ -1609,29 +1665,63 @@ TUDO </h3>
             applyCatalogTabs();
         }
 
-        // Limita imagens e elementos criados inicialmente; filtros continuam usando toda a lista.
+        // Preserva os cartões já exibidos durante o carregamento para não interromper a leitura.
+        const productBatchObserver = typeof IntersectionObserver === 'function' ?
+            new IntersectionObserver(entries => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting && entry.target._appendBatch) entry.target._appendBatch();
+                });
+            }, { rootMargin: '400px' }) : null;
+
         function renderProductBatch(grid, list) {
-            const oldButton = document.getElementById(grid.id + '-more');
-            if (oldButton) oldButton.remove();
-            if (!list.length) return;
-            let visible = 0;
-            const button = document.createElement('button');
-            button.id = grid.id + '-more';
-            button.type = 'button';
-            button.className = 'btn-interest';
-            button.style.cssText = 'display:block;margin:18px auto;width:auto;padding:12px 24px';
-            function appendBatch() {
-                const fragment = document.createDocumentFragment();
-                const end = Math.min(visible + 24, list.length);
-                for (; visible < end; visible++) fragment.appendChild(createProductCard(list[visible]));
-                grid.appendChild(fragment);
-                if (visible < list.length) {
-                    button.textContent = 'Ver mais produtos (' + (list.length - visible) + ')';
-                    grid.after(button);
-                } else button.remove();
+            const key = [searchQuery, activeCategory, currentSort].join('\u0000');
+            let state = grid._productBatch;
+            if (!state || state.key !== key) {
+                if (state) {
+                    if (productBatchObserver) productBatchObserver.unobserve(state.button);
+                    state.button.remove();
+                }
+                grid.replaceChildren();
+                const button = document.createElement('button');
+                button.id = grid.id + '-more';
+                button.type = 'button';
+                button.className = 'btn-interest';
+                button.style.cssText = 'display:block;margin:18px auto;width:auto;padding:12px 24px';
+                state = { key, count: 10, list: [], refs: [], button };
+                grid._productBatch = state;
+                button.onclick = () => {
+                    state.count += 10;
+                    drawBatch();
+                };
+                button._appendBatch = button.onclick;
             }
-            button.onclick = appendBatch;
-            appendBatch();
+            state.list = list;
+            function drawBatch() {
+                const visible = state.list.slice(0, state.count);
+                const unchangedPrefix = state.refs.every((p, i) => visible[i] === p);
+                if (!unchangedPrefix) { grid.replaceChildren(); state.refs = []; }
+                const fragment = document.createDocumentFragment();
+                for (let i = state.refs.length; i < visible.length; i++) {
+                    fragment.appendChild(createProductCard(visible[i]));
+                }
+                grid.appendChild(fragment);
+                state.refs = visible;
+                if (visible.length < state.list.length) {
+                    state.button.textContent = 'Ver mais produtos';
+                    grid.after(state.button);
+                    if (productBatchObserver) {
+                        productBatchObserver.unobserve(state.button);
+                        productBatchObserver.observe(state.button);
+                    }
+                } else {
+                    if (productBatchObserver) productBatchObserver.unobserve(state.button);
+                    state.button.remove();
+                }
+            }
+            // Atualiza a ação para usar a lista mais recente recebida do Firebase.
+            state.button.onclick = () => { state.count += 10; drawBatch(); };
+            state.button._appendBatch = state.button.onclick;
+            drawBatch();
         }
 
         function createProductCard(product) {
@@ -1681,7 +1771,7 @@ TUDO </h3>
             const product = products.find(p => p.id === id);
             if (!product) return;
 
-            document.getElementById('mImg').src = product.img;
+            document.getElementById('mImg').src = product.images?.[0] || product.img;
             const gallery = document.getElementById('mGallery');
             gallery.replaceChildren();
             const photos = Array.isArray(product.images) && product.images.length ? product.images : [product.img];
@@ -1825,6 +1915,7 @@ TUDO </h3>
                 const wrap = document.createElement('div');
                 const photo = document.createElement('img');
                 photo.src = src;
+                photo.loading = 'lazy'; photo.decoding = 'async';
                 photo.style.cssText = 'width:70px;height:70px;object-fit:cover;border-radius:6px';
                 const remove = document.createElement('button');
                 remove.type = 'button';
@@ -1840,20 +1931,123 @@ TUDO </h3>
                 gallery.append(wrap);
             });
         }
-        async function prepareGalleryForSave(sources) {
-            const budget = Math.min(PRODUCT_IMAGE_MAX_BYTES, Math.floor(220000 / Math.max(1, sources.length)));
-            const results = [];
-            for (const source of sources) {
+        function storageErrorMessage(error) {
+            if (/^storage\//.test(error.code || '')) {
+                return 'Não foi possível enviar a foto ao Firebase Storage (' + error.code + '). Confira Storage, plano Blaze, nome do bucket e regras de acesso nas instruções do painel. O produto anterior foi preservado.';
+            }
+            return error.message || 'Não foi possível salvar as fotos.';
+        }
+
+        async function uploadCatalogPhoto(data, productId, suffix) {
+            if (!adminAuthorized || !auth.currentUser) throw new Error('Entre como administrador para enviar fotos.');
+            if (typeof firebase.storage !== 'function') throw new Error('Não foi possível carregar o armazenamento. Verifique sua conexão e reabra o painel.');
+            const unique = Date.now() + '-' + Math.random().toString(36).slice(2);
+            const ref = firebase.storage().ref('catalogo/' + auth.currentUser.uid + '/' + productId + '/' + unique + '-' + suffix + '.jpg');
+            await ref.putString(data, 'data_url', {
+                contentType: 'image/jpeg', cacheControl: 'public,max-age=31536000,immutable'
+            });
+            return ref.getDownloadURL();
+        }
+
+        async function prepareGalleryForSave(sources, productId, existingProduct = null) {
+            const images = [];
+            let thumbnail = '';
+            for (let i = 0; i < sources.length; i++) {
+                const source = String(sources[i] || '').trim();
                 if (/^(data:image\/|blob:)/i.test(source)) {
+                    imageStatus('Enviando foto ' + (i + 1) + ' de ' + sources.length + '…');
                     const response = await fetch(source);
                     if (!response.ok) throw new Error('Não foi possível ler uma das fotos.');
-                    results.push((await resizeProductImage(await response.blob(), budget)).data);
+                    const blob = await response.blob();
+                    const full = await resizeProductImage(blob, 240000, 1280);
+                    images.push(await uploadCatalogPhoto(full.data, productId, 'foto-' + i));
+                    if (i === 0) {
+                        const small = await resizeProductImage(blob, 22000, 360);
+                        thumbnail = await uploadCatalogPhoto(small.data, productId, 'miniatura');
+                    }
                 } else {
-                    if (new Blob([source]).size > budget) throw new Error('O link da foto é muito longo. Envie a imagem como arquivo.');
-                    results.push(source);
+                    if (!/^https?:\/\//i.test(source)) throw new Error('Use um link HTTP/HTTPS ou selecione uma foto do dispositivo.');
+                    images.push(source);
+                    if (i === 0) {
+                        if (existingProduct?.mediaVersion === 2 && existingProduct.images?.[0] === source) {
+                            thumbnail = existingProduct.img;
+                        } else {
+                            // Links externos continuam funcionando mesmo se o provedor impedir a conversão por CORS.
+                            try {
+                                const response = await fetch(source);
+                                if (!response.ok) throw new Error('Foto externa indisponível');
+                                const small = await resizeProductImage(await response.blob(), 22000, 360);
+                                thumbnail = await uploadCatalogPhoto(small.data, productId, 'miniatura');
+                            } catch (error) {
+                                if (/^storage\//.test(error.code || '')) throw error;
+                                thumbnail = source;
+                            }
+                        }
+                    }
                 }
             }
-            return results;
+            if (!images.length) throw new Error('Adicione pelo menos uma foto.');
+            return { images, img: thumbnail || images[0], mediaVersion: 2 };
+        }
+
+        let migrationInProgress = false;
+        function downloadProductsBackup(items) {
+            const blob = new Blob([JSON.stringify({ createdAt: new Date().toISOString(), products: items }, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'backup-produtos-dtudo-' + new Date().toISOString().slice(0, 10) + '.json';
+            document.body.appendChild(link); link.click(); link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+        }
+
+        async function migrateProductImages() {
+            if (migrationInProgress || productSaveInProgress) return;
+            const status = document.getElementById('migrationStatus');
+            if (!adminAuthorized || !auth.currentUser) { status.textContent = 'Entre como administrador.'; return; }
+            migrationInProgress = true;
+            const button = document.getElementById('migrateImagesBtn'); button.disabled = true;
+            let migrated = 0;
+            let pendingCount = 0;
+            try {
+                if (stopAdminProducts) { stopAdminProducts(); stopAdminProducts = null; }
+                status.textContent = 'Preparando cópia de segurança…';
+                const snapshot = await db.collection('produtos').get({ source: 'server' });
+                const items = snapshot.docs.map(doc => ({ firestoreId: doc.id, ...doc.data() }));
+                const pending = items.filter(p => p.mediaVersion !== 2 || [p.img, ...(p.images || [])].some(src => /^(data:image\/|blob:)/i.test(String(src))));
+                pendingCount = pending.length;
+                if (!pendingCount) { status.textContent = 'Todos os produtos já usam fotos separadas.'; return; }
+                downloadProductsBackup(items);
+                for (const p of pending) {
+                    if (!adminAuthorized || !auth.currentUser) throw new Error('Sessão encerrada. Entre novamente para continuar.');
+                    status.textContent = 'Migrando produto ' + (migrated + 1) + ' de ' + pendingCount + '…';
+                    // Releitura evita sobrescrever uma edição feita durante a migração.
+                    const ref = db.collection('produtos').doc(p.firestoreId);
+                    const current = await ref.get({ source: 'server' });
+                    if (!current.exists) continue;
+                    const data = current.data();
+                    const sources = Array.isArray(data.images) && data.images.length ? data.images : [data.img];
+                    const media = await prepareGalleryForSave(sources, p.firestoreId, data);
+                    // Só troca os campos de imagem depois que todos os envios terminaram.
+                    await db.runTransaction(async transaction => {
+                        const latest = await transaction.get(ref);
+                        if (!latest.exists) throw new Error('Produto removido durante a migração.');
+                        const latestData = latest.data();
+                        if (JSON.stringify([latestData.img, latestData.images]) !== JSON.stringify([data.img, data.images])) {
+                            throw new Error('As fotos foram alteradas por outra sessão. Execute a migração novamente.');
+                        }
+                        transaction.update(ref, media);
+                    });
+                    migrated++;
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+                status.textContent = 'Concluído: ' + migrated + ' produtos migrados. Guarde a cópia de segurança.';
+            } catch (error) {
+                status.textContent = 'Migração interrompida após ' + migrated + ' de ' + pendingCount + ' produtos. ' + storageErrorMessage(error) + ' Clique novamente para continuar os pendentes.';
+            } finally {
+                migrationInProgress = false; button.disabled = false; imageStatus('');
+                if (adminAuthorized && auth.currentUser) startAdminProducts();
+            }
         }
 
         async function prepareImageForSave(source) {
@@ -1891,7 +2085,7 @@ TUDO </h3>
             status.textContent = message;
         }
 
-        async function resizeProductImage(file, maxBytes = PRODUCT_IMAGE_MAX_BYTES) {
+        async function resizeProductImage(file, maxBytes = PRODUCT_IMAGE_MAX_BYTES, maxDimension = 800) {
             const url = URL.createObjectURL(file);
             try {
                 const photo = await new Promise((resolve, reject) => {
@@ -1900,7 +2094,7 @@ TUDO </h3>
                     img.onerror = () => reject(new Error('Não foi possível abrir a foto. Use uma imagem JPG, PNG ou WebP.'));
                     img.src = url;
                 });
-                let scale = Math.min(1, 800 / Math.max(photo.naturalWidth, photo.naturalHeight));
+                let scale = Math.min(1, maxDimension / Math.max(photo.naturalWidth, photo.naturalHeight));
                 const canvas = document.createElement('canvas');
                 for (let attempt = 0; attempt < 16; attempt++) {
                     canvas.width = Math.max(1, Math.round(photo.naturalWidth * scale));
@@ -1939,7 +2133,7 @@ TUDO </h3>
             try {
                 const added = [];
                 for (const file of files) {
-                    const result = await resizeProductImage(file);
+                    const result = await resizeProductImage(file, 240000, 1280);
                     if (version !== productImageVersion) return;
                     added.push(result.data);
                 }
@@ -2017,7 +2211,10 @@ TUDO </h3>
                 img = imgPreview.src;
             }
 
-            if (productSaveInProgress) return;
+            if (productSaveInProgress || migrationInProgress) return;
+            if (!adminAuthorized || !auth.currentUser) { alert('Entre como administrador.'); return; }
+            const productRef = firestoreId ? db.collection('produtos').doc(firestoreId) : db.collection('produtos').doc();
+            const existingProduct = products.find(p => p.firestoreId === firestoreId);
             productSaveInProgress = true;
             const saveButton = document.querySelector('#productForm button[type="submit"]');
             if (saveButton) saveButton.disabled = true;
@@ -2025,18 +2222,19 @@ TUDO </h3>
             try {
                 const sources = productPhotos.length ? [...productPhotos] : [img];
                 if (imgUrlInput && !sources.includes(imgUrlInput)) sources.unshift(imgUrlInput);
-                images = await prepareGalleryForSave(sources);
-                img = images[0];
+                const media = await prepareGalleryForSave(sources, productRef.id, existingProduct);
+                images = media.images;
+                img = media.img;
             } catch (error) {
                 productSaveInProgress = false;
                 if (saveButton) saveButton.disabled = false;
-                alert(error.message);
+                alert(storageErrorMessage(error));
                 return;
             }
 
             const productData = {
                 id: firestoreId ? (products.find(p => p.firestoreId === firestoreId)?.id || Date.now()) : Date.now(),
-                name, price, oldPrice, desc, category, available, isOffer, isFeatured, isNew, img, images, hidden: false
+                name, price, oldPrice, desc, category, available, isOffer, isFeatured, isNew, img, images, mediaVersion: 2, hidden: existingProduct?.hidden || false
             };
 
             try {
@@ -2047,8 +2245,8 @@ TUDO </h3>
                 if (new Blob([JSON.stringify(productData)]).size > 900000) {
                     throw new Error('O produto contém dados demais. Reduza a descrição ou selecione outra foto.');
                 }
-                if (firestoreId) await db.collection("produtos").doc(firestoreId).update(productData);
-                else await db.collection("produtos").add(productData);
+                if (firestoreId) await productRef.update(productData);
+                else await productRef.set(productData);
                 resetForm();
                 alert('Produto salvo com sucesso no Firebase!');
             } catch (error) {
@@ -2085,7 +2283,7 @@ TUDO </h3>
             document.getElementById('pImgUrl').value = '';
             
             const preview = document.getElementById('pImgPreview');
-            preview.src = p.img;
+            preview.src = productPhotos[0] || p.img;
             preview.style.display = 'block';
 
             document.getElementById('formAdminTitle').innerText = "✏️ Editar Produto";
@@ -2118,7 +2316,7 @@ TUDO </h3>
             document.getElementById('formAdminTitle').innerText = "+ Adicionar Novo Produto";
         }
 
-        Object.assign(window, { applyCatalogTabs, renderTabEditor, saveCatalogTabs, updateCatalogLoadControl, loadNextProductPage, ensureAllProducts, startAdminProducts, updateWhatsappLinks, saveCart, updateCartCount, addToCart, changeCartQty, removeFromCart, openCart, closeCart, renderCart, clearPaymentError, updatePaymentOptions, getPaymentLabel, sendFullOrder, filterCategory, escapeCategoryText, toggleCategoryManager, categoryNameIsValid, addCategory, deleteCategory, renderCategoryControls, getSortedProducts, renderCatalog, renderProductBatch, createProductCard, openModal, closeModal, openAdminModal, closeAdminModal, loginAdmin, logoutAdmin, saveConfig, changeSortOrder, renderProductPhotos, prepareGalleryForSave, prepareImageForSave, imageStatus, resizeProductImage, previewImageFile, processProductImageFile, renderAdminTable, handleSaveProduct, editProduct, toggleHideProduct, deleteProduct, resetForm });
+        Object.assign(window, { migrateProductImages, applyCatalogTabs, renderTabEditor, saveCatalogTabs, updateCatalogLoadControl, loadNextProductPage, ensureAllProducts, startAdminProducts, updateWhatsappLinks, saveCart, updateCartCount, addToCart, changeCartQty, removeFromCart, openCart, closeCart, renderCart, clearPaymentError, updatePaymentOptions, getPaymentLabel, sendFullOrder, filterCategory, escapeCategoryText, toggleCategoryManager, categoryNameIsValid, addCategory, deleteCategory, renderCategoryControls, getSortedProducts, renderCatalog, renderProductBatch, createProductCard, openModal, closeModal, openAdminModal, closeAdminModal, loginAdmin, logoutAdmin, saveConfig, changeSortOrder, renderProductPhotos, prepareGalleryForSave, prepareImageForSave, imageStatus, resizeProductImage, previewImageFile, processProductImageFile, renderAdminTable, handleSaveProduct, editProduct, toggleHideProduct, deleteProduct, resetForm });
         (() => {
             document.getElementById('newCategory').addEventListener('keydown', event => {
                 if (event.key === 'Enter') { event.preventDefault(); addCategory(); }
@@ -2158,10 +2356,9 @@ TUDO </h3>
                 }
             }, error => alert('Erro ao carregar categorias: ' + error.message));
 
-            // A primeira consulta baixa somente seis produtos, incluindo suas fotos.
+            // Mostra os primeiros dez e continua baixando lotes de dez em segundo plano.
             updateCatalogLoadControl();
-            loadNextProductPage();
-            if (currentSort !== 'recent') ensureAllProducts();
+            ensureAllProducts();
 
             updateCartCount();
         })();
