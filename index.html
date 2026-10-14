@@ -1139,18 +1139,38 @@ TUDO </h3>
         firebase.initializeApp(firebaseConfig);
         const db = firebase.firestore();
         const auth = firebase.auth();
-        // Ativa IndexedDB antes de iniciar qualquer consulta ao Firestore.
-        // O cache permanece entre acessos e pode ser compartilhado por várias abas.
-        await db.enablePersistence({ synchronizeTabs: true }).catch(error => {
-            console.warn('Cache persistente indisponível; usando cache em memória.', error.code);
-        });
+        // O catálogo inicial usa um cache local leve; não aguarda a abertura do IndexedDB
+        // antes da primeira consulta ao servidor.
         let adminAuthorized = false;
         let searchTimer;
 
         const DEFAULT_WHATSAPP = "558695333303";
         const INSTAGRAM_URL = "https://www.instagram.com/lojadtudo_dl/";
         
-        let products = [];
+        const CATALOG_CACHE_KEY = 'lojaddtudo_catalog_v1';
+        function readCatalogCache() {
+            try {
+                const cached = JSON.parse(localStorage.getItem(CATALOG_CACHE_KEY) || '[]');
+                return Array.isArray(cached) ? cached.filter(p => p && p.firestoreId && p.name) : [];
+            } catch (_) { return []; }
+        }
+        function saveCatalogCache(items) {
+            try {
+                // Mantém somente dados leves da vitrine; fotos grandes ficam no Firestore/Storage.
+                const fields = ['firestoreId', 'id', 'name', 'price', 'oldPrice', 'desc', 'category',
+                    'available', 'isOffer', 'isFeatured', 'isNew', 'img', 'hidden', 'mediaVersion',
+                    'photoDocId', 'photoVersion'];
+                const compact = items.slice(0, 30).map(item => {
+                    const copy = {};
+                    fields.forEach(field => { if (item[field] !== undefined) copy[field] = item[field]; });
+                    if (typeof copy.img === 'string' && copy.img.length > 25000) copy.img = '';
+                    return copy;
+                });
+                const serialized = JSON.stringify(compact);
+                if (serialized.length <= 1500000) localStorage.setItem(CATALOG_CACHE_KEY, serialized);
+            } catch (_) { /* A vitrine continua funcionando sem cache local. */ }
+        }
+        let products = readCatalogCache();
         const defaultCategories = ['Eletrônicos', 'Casa', 'Beleza', 'Utilidades', 'Brinquedos', 'Papelaria', 'Moda', 'Acessórios'];
         let categories = defaultCategories.slice();
         const categoriesDoc = db.collection('configuracoes').doc('categorias');
@@ -1288,6 +1308,7 @@ TUDO </h3>
                     }
                     snapshot.docs.forEach(doc => merged.set(doc.id, { firestoreId: doc.id, ...doc.data() }));
                     products = Array.from(merged.values());
+                    saveCatalogCache(products);
                     if (snapshot.docs.length) productCursor = snapshot.docs[snapshot.docs.length - 1];
                     productPagesDone = snapshot.docs.length < pageSize;
                     catalogLoadError = false;
@@ -1323,7 +1344,7 @@ TUDO </h3>
                     await waitForCatalogPriority();
                     if (!await loadNextProductPage()) break;
                     // A imagem aberta pelo cliente tem prioridade sobre a próxima página.
-                    await new Promise(resolve => setTimeout(resolve, 700));
+                    await new Promise(resolve => setTimeout(resolve, 120));
                 }
             }).finally(() => { allProductsTask = null; });
             return allProductsTask;
@@ -2388,6 +2409,9 @@ TUDO </h3>
             }, error => alert('Erro ao carregar categorias: ' + error.message));
 
             // Mostra os primeiros dez e continua baixando lotes de dez em segundo plano.
+            // Exibe já o último catálogo salvo neste aparelho enquanto atualiza os dados online.
+            renderCategoryControls();
+            renderCatalog();
             updateCatalogLoadControl();
             ensureAllProducts();
 
